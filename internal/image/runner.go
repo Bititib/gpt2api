@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,11 +80,12 @@ type RunResult struct {
 }
 
 // Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
+//
+// N > 1 时并发启动 N 个独立 goroutine,每个各自走完整链路出 1 张图,
+// 最终合并结果——比向单一会话请求 N 张快得多(ChatGPT f/conversation 每轮只产 1 张)。
 func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	start := time.Now()
 	if opt.MaxAttempts <= 0 {
-		// 默认只跑 1 次,不为"没命中"做跨账号重试。
-		// 仅当首轮因为没调度到账号 / 账号被硬限流时,才会用 MaxAttempts>1 做 1 次换账号重试。
 		opt.MaxAttempts = 1
 	}
 	if opt.PerAttemptTimeout <= 0 {
@@ -93,9 +95,6 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		opt.PollMaxWait = 300 * time.Second
 	}
 	if opt.UpstreamModel == "" {
-		// 对齐浏览器抓包 + 参考实现:图像走 f/conversation 时 model 字段和
-		// 普通 chat 一致用 "auto",通过 system_hints=["picture_v2"] 让上游知道
-		// 这是图像任务。硬写 "gpt-5-3" 在免费/新账号上会直接 404。
 		opt.UpstreamModel = "auto"
 	}
 	if opt.N <= 0 {
@@ -109,43 +108,47 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		_ = r.dao.MarkRunning(ctx, opt.TaskID, 0)
 	}
 
-	for attempt := 1; attempt <= opt.MaxAttempts; attempt++ {
-		result.Attempts = attempt
-		if err := ctx.Err(); err != nil {
-			result.ErrorCode = ErrUnknown
-			result.ErrorMessage = err.Error()
-			break
-		}
+	if opt.N > 1 {
+		// 并发模式:N 个 goroutine 各独立出 1 张
+		r.runParallel(ctx, opt, start, result)
+	} else {
+		// 串行模式(原逻辑):带跨账号重试
+		for attempt := 1; attempt <= opt.MaxAttempts; attempt++ {
+			result.Attempts = attempt
+			if err := ctx.Err(); err != nil {
+				result.ErrorCode = ErrUnknown
+				result.ErrorMessage = err.Error()
+				break
+			}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, opt.PerAttemptTimeout)
-		ok, status, err := r.runOnce(attemptCtx, opt, result)
-		cancel()
+			attemptCtx, cancel := context.WithTimeout(ctx, opt.PerAttemptTimeout)
+			ok, status, err := r.runOnce(attemptCtx, opt, result)
+			cancel()
 
-		if ok {
-			result.Status = StatusSuccess
-			result.ErrorCode = ""
-			result.ErrorMessage = ""
-			break
-		}
-		if err != nil {
-			result.ErrorMessage = err.Error()
-		}
-		result.ErrorCode = status
+			if ok {
+				result.Status = StatusSuccess
+				result.ErrorCode = ""
+				result.ErrorMessage = ""
+				break
+			}
+			if err != nil {
+				result.ErrorMessage = err.Error()
+			}
+			result.ErrorCode = status
 
-		// 仅对可重试错误做跨账号重试:限流 / 无账号 / 鉴权失败 / 瞬态网络断连。
-		// 其他错误(poll 超时 / 上游 5xx)直接抛给用户,不再悄悄吞掉时间。
-		if attempt >= opt.MaxAttempts {
-			break
+			if attempt >= opt.MaxAttempts {
+				break
+			}
+			retryable := status == ErrRateLimited || status == ErrNoAccount ||
+				status == ErrAuthRequired || status == ErrNetworkTransient
+			if !retryable {
+				break
+			}
+			logger.L().Info("image runner retry with another account",
+				zap.String("task_id", opt.TaskID),
+				zap.String("reason", status),
+				zap.Int("attempt", attempt))
 		}
-		retryable := status == ErrRateLimited || status == ErrNoAccount ||
-			status == ErrAuthRequired || status == ErrNetworkTransient
-		if !retryable {
-			break
-		}
-		logger.L().Info("image runner retry with another account",
-			zap.String("task_id", opt.TaskID),
-			zap.String("reason", status),
-			zap.Int("attempt", attempt))
 	}
 
 	result.DurationMs = time.Since(start).Milliseconds()
@@ -155,8 +158,6 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		if result.Status == StatusSuccess {
 			_ = r.dao.MarkSuccess(ctx, opt.TaskID, result.ConversationID,
 				result.FileIDs, result.SignedURLs, 0 /* credit_cost 由网关负责写 */)
-			// 成功后立即乐观扣减账号额度,n = 本次实际产出张数。
-			// 这样不用等后台探测,前端刷新后即可看到正确剩余数字。
 			if r.quotaDecr != nil && result.AccountID > 0 {
 				n := len(result.FileIDs)
 				if n == 0 {
@@ -169,6 +170,103 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		}
 	}
 	return result
+}
+
+// runParallel 并发启动 opt.N 个独立请求,每个各出 1 张图,最终合并到 result。
+// 只要有 ≥1 张成功就算整体成功;全部失败才返回失败。
+// 各 goroutine 不写 DAO(TaskID 置空),写库由外层 Run 统一完成。
+func (r *Runner) runParallel(ctx context.Context, opt RunOptions, start time.Time, result *RunResult) {
+	type subResult struct {
+		ok         bool
+		fileIDs    []string
+		signedURLs []string
+		convID     string
+		accountID  uint64
+		errCode    string
+		errMsg     string
+	}
+
+	n := opt.N
+	ch := make(chan subResult, n)
+
+	// 子任务:单张、不写 DAO
+	subOpt := opt
+	subOpt.N = 1
+	subOpt.TaskID = "" // 禁用 DAO,避免多 goroutine 互相覆盖
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sub := &RunResult{Status: StatusFailed, ErrorCode: ErrUnknown}
+			attemptCtx, cancel := context.WithTimeout(ctx, opt.PerAttemptTimeout)
+			defer cancel()
+			ok, status, err := r.runOnce(attemptCtx, subOpt, sub)
+			msg := ""
+			if err != nil {
+				msg = err.Error()
+			}
+			if !ok && status == "" {
+				status = sub.ErrorCode
+			}
+			ch <- subResult{
+				ok:         ok,
+				fileIDs:    sub.FileIDs,
+				signedURLs: sub.SignedURLs,
+				convID:     sub.ConversationID,
+				accountID:  sub.AccountID,
+				errCode:    status,
+				errMsg:     msg,
+			}
+		}()
+	}
+
+	// 等待全部完成后关闭 channel
+	go func() { wg.Wait(); close(ch) }()
+
+	var (
+		successCount  int
+		lastErrCode   string
+		lastErrMsg    string
+	)
+	for sr := range ch {
+		if sr.ok {
+			successCount++
+			result.FileIDs = append(result.FileIDs, sr.fileIDs...)
+			result.SignedURLs = append(result.SignedURLs, sr.signedURLs...)
+			if result.ConversationID == "" {
+				result.ConversationID = sr.convID
+			}
+			if result.AccountID == 0 {
+				result.AccountID = sr.accountID
+			}
+		} else {
+			lastErrCode = sr.errCode
+			lastErrMsg = sr.errMsg
+		}
+	}
+	result.Attempts = n
+
+	if successCount > 0 {
+		result.Status = StatusSuccess
+		result.ErrorCode = ""
+		result.ErrorMessage = ""
+		logger.L().Info("image runner parallel done",
+			zap.String("task_id", opt.TaskID),
+			zap.Int("requested", n),
+			zap.Int("succeeded", successCount),
+			zap.Int("got_images", len(result.FileIDs)),
+		)
+	} else {
+		result.ErrorCode = lastErrCode
+		result.ErrorMessage = lastErrMsg
+		logger.L().Warn("image runner parallel all failed",
+			zap.String("task_id", opt.TaskID),
+			zap.Int("requested", n),
+			zap.String("last_err", lastErrCode),
+		)
+	}
 }
 
 // runOnce 一次完整的尝试。返回 (ok, errorCode, err)。
